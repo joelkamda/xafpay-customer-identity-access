@@ -94,3 +94,43 @@ class Xcia2RuntimeSettings(BaseSettings):
                 "signing_private_key_env must be an uppercase environment variable name"
             )
         return value
+
+
+class Xcia3RuntimeSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="XCIA3_", extra="forbid", frozen=True)
+
+    credential_secret_env: str = Field(min_length=1, max_length=255)
+    phone_provider: str = "deterministic_fake"
+    challenge_ttl_seconds: int = Field(default=300, ge=30, le=900)
+    challenge_attempt_limit: int = Field(default=5, ge=1, le=10)
+    lockout_after_failures: int = Field(default=5, ge=3, le=20)
+    lockout_seconds: int = Field(default=900, ge=60, le=86400)
+    trusted_device_ttl_seconds: int = Field(default=2592000, ge=3600, le=31536000)
+    scrypt_n: int = 32768
+    scrypt_r: int = 8
+    scrypt_p: int = 1
+
+    @field_validator("credential_secret_env")
+    @classmethod
+    def validate_credential_secret_env(cls, value: str) -> str:
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{2,254}", value) is None:
+            raise ValueError("credential_secret_env must name an uppercase environment variable")
+        return value
+
+    @model_validator(mode="after")
+    def validate_security_policy(self) -> Xcia3RuntimeSettings:
+        if self.phone_provider != "deterministic_fake":
+            raise ValueError("XCIA3 authorizes only the deterministic fake phone provider")
+        if (self.scrypt_n, self.scrypt_r, self.scrypt_p) != (32768, 8, 1):
+            raise ValueError("XCIA3 Scrypt policy must remain fixed")
+        return self
+
+    def validate_for_environment(
+        self,
+        environment: RuntimeEnvironment,
+        available_secret: bytes | None,
+    ) -> None:
+        if available_secret is None or len(available_secret) < 32:
+            raise ValueError("XCIA3 credential secret is required")
+        if environment is RuntimeEnvironment.PRODUCTION:
+            raise ValueError("XCIA3 fake phone provider is forbidden in production")

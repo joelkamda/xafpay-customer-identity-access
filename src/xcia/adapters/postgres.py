@@ -19,12 +19,15 @@ from xcia.domain import (
 )
 from xcia.persistence import XciaDatabase
 from xcia.persistence.schema import (
+    AuthenticationBucketRow,
+    CustomerPinCredentialRow,
     CustomerSubjectRow,
     RefreshFamilyRow,
     ReplayJtiRow,
     SecurityEventRow,
     SessionRow,
     SigningKeyRow,
+    TrustedDeviceRow,
 )
 from xcia.policies import SubjectPolicy
 
@@ -113,6 +116,30 @@ class DurableSubjectStore:
                     CustomerSubjectRow.environment == environment,
                 )
             )
+            if row is None:
+                return None
+            return ExternalCustomerSubject(
+                value=row.subject_value,
+                relying_party=row.relying_party,
+                environment=row.environment,
+            )
+
+    def subject_id(self, subject: ExternalCustomerSubject) -> str:
+        with self._database.session() as session:
+            row = session.scalar(
+                select(CustomerSubjectRow).where(
+                    CustomerSubjectRow.subject_value == subject.value,
+                    CustomerSubjectRow.relying_party == subject.relying_party,
+                    CustomerSubjectRow.environment == subject.environment,
+                )
+            )
+            if row is None:
+                raise ValueError("durable subject must exist")
+            return row.id
+
+    def get_by_id(self, subject_id: str) -> ExternalCustomerSubject | None:
+        with self._database.session() as session:
+            row = session.get(CustomerSubjectRow, subject_id)
             if row is None:
                 return None
             return ExternalCustomerSubject(
@@ -233,6 +260,18 @@ class DurableSessionStore:
                     update(SessionRow)
                     .where(SessionRow.sid == sid, SessionRow.revoked_at.is_(None))
                     .values(revoked_at=moment)
+                )
+
+    def revoke_subject_sessions(self, subject_value: str, *, at: datetime) -> None:
+        with self._database.session() as session:
+            with session.begin():
+                session.execute(
+                    update(SessionRow)
+                    .where(
+                        SessionRow.subject_value == subject_value,
+                        SessionRow.revoked_at.is_(None),
+                    )
+                    .values(revoked_at=at)
                 )
 
     def is_sid_revoked(self, sid: str, *, at: datetime | None = None) -> bool:
@@ -501,3 +540,185 @@ class SecurityEventStore:
                         occurred_at=moment,
                     )
                 )
+
+
+class DurablePinCredentialStore:
+    def __init__(self, database: XciaDatabase) -> None:
+        self._database = database
+
+    def find_by_phone_digest(self, digest: str) -> CustomerPinCredentialRow | None:
+        with self._database.session() as session:
+            return session.scalar(
+                select(CustomerPinCredentialRow).where(
+                    CustomerPinCredentialRow.phone_lookup_digest == digest,
+                    CustomerPinCredentialRow.status == "active",
+                )
+            )
+
+    def replace(
+        self,
+        *,
+        subject_id: str,
+        phone_lookup_digest: str,
+        verifier: str,
+        now: datetime,
+    ) -> CustomerPinCredentialRow:
+        with self._database.session() as session:
+            with session.begin():
+                previous = session.scalar(
+                    select(CustomerPinCredentialRow)
+                    .where(CustomerPinCredentialRow.phone_lookup_digest == phone_lookup_digest)
+                    .with_for_update()
+                )
+                version = 1
+                if previous is not None:
+                    previous.status = "superseded"
+                    previous.updated_at = now
+                    version = previous.credential_version + 1
+                row = CustomerPinCredentialRow(
+                    credential_id=str(uuid.uuid4()),
+                    customer_subject_id=subject_id,
+                    credential_type="XAFPAY_PIN",
+                    phone_lookup_digest=phone_lookup_digest,
+                    credential_verifier=verifier,
+                    credential_version=version,
+                    status="active",
+                    created_at=now,
+                    updated_at=now,
+                    failed_attempt_count=0,
+                    locked_until=None,
+                    last_success_at=None,
+                )
+                session.add(row)
+                session.flush()
+                return row
+
+    def record_failure(
+        self,
+        row: CustomerPinCredentialRow,
+        *,
+        now: datetime,
+        lockout_after_failures: int,
+        lockout_seconds: int,
+    ) -> None:
+        with self._database.session() as session:
+            with session.begin():
+                current = session.get(CustomerPinCredentialRow, row.credential_id)
+                if current is None:
+                    return
+                current.failed_attempt_count += 1
+                current.updated_at = now
+                if current.failed_attempt_count >= lockout_after_failures:
+                    excess = current.failed_attempt_count - lockout_after_failures
+                    seconds = min(lockout_seconds * (2**excess), 86_400)
+                    current.locked_until = now + timedelta(seconds=seconds)
+
+    def record_success(self, row: CustomerPinCredentialRow, *, now: datetime) -> None:
+        with self._database.session() as session:
+            with session.begin():
+                current = session.get(CustomerPinCredentialRow, row.credential_id)
+                if current is None:
+                    raise ValueError("credential is missing")
+                current.failed_attempt_count = 0
+                current.locked_until = None
+                current.last_success_at = now
+                current.updated_at = now
+
+
+class DurableAuthenticationControlStore:
+    def __init__(self, database: XciaDatabase) -> None:
+        self._database = database
+
+    def is_locked(self, scope_type: str, scope_digest: str, *, now: datetime) -> bool:
+        with self._database.session() as session:
+            row = session.scalar(
+                select(AuthenticationBucketRow).where(
+                    AuthenticationBucketRow.scope_type == scope_type,
+                    AuthenticationBucketRow.scope_digest == scope_digest,
+                )
+            )
+            return row is not None and row.locked_until is not None and now < row.locked_until
+
+    def record_failure(
+        self,
+        scope_type: str,
+        scope_digest: str,
+        *,
+        now: datetime,
+        lockout_after_failures: int,
+        lockout_seconds: int,
+    ) -> None:
+        with self._database.session() as session:
+            with session.begin():
+                row = session.scalar(
+                    select(AuthenticationBucketRow)
+                    .where(
+                        AuthenticationBucketRow.scope_type == scope_type,
+                        AuthenticationBucketRow.scope_digest == scope_digest,
+                    )
+                    .with_for_update()
+                )
+                if row is None:
+                    row = AuthenticationBucketRow(
+                        id=str(uuid.uuid4()),
+                        scope_type=scope_type,
+                        scope_digest=scope_digest,
+                        failed_attempt_count=0,
+                        locked_until=None,
+                        updated_at=now,
+                    )
+                    session.add(row)
+                row.failed_attempt_count += 1
+                row.updated_at = now
+                if row.failed_attempt_count >= lockout_after_failures:
+                    excess = row.failed_attempt_count - lockout_after_failures
+                    seconds = min(lockout_seconds * (2**excess), 86_400)
+                    row.locked_until = now + timedelta(seconds=seconds)
+
+    def clear_failures(self, scope_type: str, scope_digest: str, *, now: datetime) -> None:
+        with self._database.session() as session:
+            with session.begin():
+                row = session.scalar(
+                    select(AuthenticationBucketRow).where(
+                        AuthenticationBucketRow.scope_type == scope_type,
+                        AuthenticationBucketRow.scope_digest == scope_digest,
+                    )
+                )
+                if row is not None:
+                    row.failed_attempt_count = 0
+                    row.locked_until = None
+                    row.updated_at = now
+
+    def trust_device(self, subject_id: str, device_digest: str, *, now: datetime) -> None:
+        with self._database.session() as session:
+            with session.begin():
+                row = session.scalar(
+                    select(TrustedDeviceRow).where(
+                        TrustedDeviceRow.customer_subject_id == subject_id,
+                        TrustedDeviceRow.device_digest == device_digest,
+                    )
+                )
+                if row is None:
+                    session.add(
+                        TrustedDeviceRow(
+                            id=str(uuid.uuid4()),
+                            customer_subject_id=subject_id,
+                            device_digest=device_digest,
+                            trusted_at=now,
+                            last_seen_at=now,
+                        )
+                    )
+                else:
+                    row.last_seen_at = now
+
+    def is_trusted_device(self, subject_id: str, device_digest: str) -> bool:
+        with self._database.session() as session:
+            return (
+                session.scalar(
+                    select(TrustedDeviceRow.id).where(
+                        TrustedDeviceRow.customer_subject_id == subject_id,
+                        TrustedDeviceRow.device_digest == device_digest,
+                    )
+                )
+                is not None
+            )

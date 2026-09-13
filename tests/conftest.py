@@ -62,6 +62,9 @@ def xcia2_database_url() -> str:
 def database(xcia2_database_url: str) -> Iterator[XciaDatabase]:
     database = XciaDatabase(xcia2_database_url)
     table_order = (
+        "xcia_trusted_devices",
+        "xcia_authentication_buckets",
+        "xcia_customer_pin_credentials",
         "xcia_security_events",
         "xcia_replay_jtis",
         "xcia_refresh_families",

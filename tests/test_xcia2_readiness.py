@@ -65,7 +65,7 @@ def test_readiness_passes_with_database_schema_and_signing_authority(
         database=database,
         signing_keys=provider,
         jwks=provider,
-        expected_revision="xcia2_0001",
+        expected_revision="xcia3_0001",
     )
     client = cast(_Client, TestClient(create_app(_staging_settings(), probe)))
     response = client.get("/health/ready")

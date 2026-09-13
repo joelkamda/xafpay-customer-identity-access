@@ -132,3 +132,62 @@ class SecurityEventRow(Base):
     sid: Mapped[str | None] = mapped_column(String(255))
     detail: Mapped[str] = mapped_column(Text, nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class CustomerPinCredentialRow(Base):
+    __tablename__ = "xcia_customer_pin_credentials"
+    __table_args__ = (
+        UniqueConstraint(
+            "phone_lookup_digest",
+            "credential_version",
+            name="uq_xcia_pin_phone_lookup_version",
+        ),
+    )
+
+    credential_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    customer_subject_id: Mapped[str] = mapped_column(
+        ForeignKey("xcia_customer_subjects.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    credential_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="XAFPAY_PIN"
+    )
+    phone_lookup_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    credential_verifier: Mapped[str] = mapped_column(Text, nullable=False)
+    credential_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    failed_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AuthenticationBucketRow(Base):
+    __tablename__ = "xcia_authentication_buckets"
+    __table_args__ = (
+        UniqueConstraint("scope_type", "scope_digest", name="uq_xcia_auth_bucket_scope"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    scope_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    scope_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    failed_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class TrustedDeviceRow(Base):
+    __tablename__ = "xcia_trusted_devices"
+    __table_args__ = (
+        UniqueConstraint("customer_subject_id", "device_digest", name="uq_xcia_trusted_device"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    customer_subject_id: Mapped[str] = mapped_column(
+        ForeignKey("xcia_customer_subjects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    device_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    trusted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

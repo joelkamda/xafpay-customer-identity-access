@@ -1,3 +1,8 @@
+from xcia.domain.authentication import (
+    AuthenticationFailure,
+    CredentialStatus,
+    PhoneVerificationChallenge,
+)
 from xcia.domain.durable import (
     DurableSessionSnapshot,
     RefreshTokenMaterial,
@@ -19,10 +24,13 @@ from xcia.domain.models import (
 
 __all__ = [
     "ConfirmationClaim",
+    "AuthenticationFailure",
+    "CredentialStatus",
     "CustomerAuthAssertionClaims",
     "DurableSessionSnapshot",
     "ExternalCustomerSubject",
     "RefreshFamilyReference",
+    "PhoneVerificationChallenge",
     "RefreshTokenMaterial",
     "RelyingPartyTrustPolicy",
     "ReplayDecision",
