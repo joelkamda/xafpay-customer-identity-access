@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from urllib.parse import urlsplit
 
@@ -63,5 +64,33 @@ class XciaSettings(BaseSettings):
 
     @classmethod
     def from_environment(cls) -> XciaSettings:
-        # BaseSettings resolves required values from XCIA_* environment variables.
         return cls()  # pyright: ignore[reportCallIssue]
+
+
+class Xcia2RuntimeSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="XCIA2_", extra="forbid", frozen=True)
+
+    database_url: str = Field(min_length=1)
+    signing_key_kid: str = Field(min_length=8, max_length=255)
+    signing_private_key_env: str = Field(min_length=1, max_length=255)
+    migration_revision: str = "xcia2_0001"
+
+    @field_validator("database_url")
+    @classmethod
+    def validate_database_url(cls, value: str) -> str:
+        if not value.startswith("postgresql+psycopg://"):
+            raise ValueError("XCIA2 requires PostgreSQL through the psycopg driver")
+        lowered = value.lower()
+        forbidden = ("wallet", "xbos", "customer-channel", "customer_channel", "core-ledger")
+        if any(marker in lowered for marker in forbidden):
+            raise ValueError("XCIA2 database URL appears to target another project database")
+        return value
+
+    @field_validator("signing_private_key_env")
+    @classmethod
+    def validate_secret_env_name(cls, value: str) -> str:
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{2,254}", value) is None:
+            raise ValueError(
+                "signing_private_key_env must be an uppercase environment variable name"
+            )
+        return value

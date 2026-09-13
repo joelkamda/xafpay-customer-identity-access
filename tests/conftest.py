@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Iterator
 
 import pytest
+from sqlalchemy import text
 
 from xcia.config import RuntimeEnvironment, XciaSettings
 from xcia.domain import ConfirmationClaim, CustomerAuthAssertionClaims, RelyingPartyTrustPolicy
+from xcia.persistence import XciaDatabase
 
 
 @pytest.fixture
@@ -45,3 +48,31 @@ def claim_factory() -> Callable[..., CustomerAuthAssertionClaims]:
         return CustomerAuthAssertionClaims.model_validate(data)
 
     return make
+
+
+@pytest.fixture(scope="session")
+def xcia2_database_url() -> str:
+    value = os.environ.get("XCIA2_TEST_DATABASE_URL")
+    if value is None or not value.startswith("postgresql+psycopg://"):
+        pytest.fail("XCIA2_TEST_DATABASE_URL must point to disposable PostgreSQL")
+    return value
+
+
+@pytest.fixture
+def database(xcia2_database_url: str) -> Iterator[XciaDatabase]:
+    database = XciaDatabase(xcia2_database_url)
+    table_order = (
+        "xcia_security_events",
+        "xcia_replay_jtis",
+        "xcia_refresh_families",
+        "xcia_sessions",
+        "xcia_signing_keys",
+        "xcia_customer_subjects",
+    )
+    with database.engine.begin() as connection:
+        for table_name in table_order:
+            connection.execute(text(f"DELETE FROM {table_name}"))
+    try:
+        yield database
+    finally:
+        database.dispose()
