@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from enum import StrEnum
 from urllib.parse import urlsplit
@@ -109,6 +110,12 @@ class Xcia3RuntimeSettings(BaseSettings):
     scrypt_n: int = 32768
     scrypt_r: int = 8
     scrypt_p: int = 1
+    infobip_base_url: str | None = None
+    infobip_2fa_application_id: str | None = None
+    infobip_2fa_message_id: str | None = None
+    infobip_sender_id: str | None = None
+    infobip_api_key_env: str = "XAFPAY_XCIA_INFOBIP_API_KEY"
+    infobip_request_timeout_seconds: int = Field(default=10, ge=1, le=30)
 
     @field_validator("credential_secret_env")
     @classmethod
@@ -119,10 +126,12 @@ class Xcia3RuntimeSettings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_security_policy(self) -> Xcia3RuntimeSettings:
-        if self.phone_provider != "deterministic_fake":
-            raise ValueError("XCIA3 authorizes only the deterministic fake phone provider")
+        if self.phone_provider not in {"deterministic_fake", "infobip_2fa"}:
+            raise ValueError("phone_provider must select a supported XCIA provider")
         if (self.scrypt_n, self.scrypt_r, self.scrypt_p) != (32768, 8, 1):
             raise ValueError("XCIA3 Scrypt policy must remain fixed")
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{2,254}", self.infobip_api_key_env) is None:
+            raise ValueError("infobip_api_key_env must name an uppercase environment variable")
         return self
 
     def validate_for_environment(
@@ -132,5 +141,23 @@ class Xcia3RuntimeSettings(BaseSettings):
     ) -> None:
         if available_secret is None or len(available_secret) < 32:
             raise ValueError("XCIA3 credential secret is required")
-        if environment is RuntimeEnvironment.PRODUCTION:
+        if environment is RuntimeEnvironment.PRODUCTION and self.phone_provider != "infobip_2fa":
             raise ValueError("XCIA3 fake phone provider is forbidden in production")
+        if environment is RuntimeEnvironment.PRODUCTION:
+            self.require_infobip_configuration()
+            if not os.environ.get(self.infobip_api_key_env):
+                raise ValueError("Infobip API key binding is required in production")
+
+    def require_infobip_configuration(self) -> tuple[str, str, str, str]:
+        values = (
+            self.infobip_base_url,
+            self.infobip_2fa_application_id,
+            self.infobip_2fa_message_id,
+            self.infobip_sender_id,
+        )
+        if any(value is None or not value.strip() for value in values):
+            raise ValueError("Infobip provider configuration is incomplete")
+        base_url = self.infobip_base_url
+        if base_url is None or urlsplit(base_url).scheme != "https":
+            raise ValueError("Infobip base URL must use HTTPS")
+        return values  # type: ignore[return-value]
