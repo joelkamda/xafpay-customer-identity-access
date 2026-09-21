@@ -4,16 +4,22 @@ from datetime import UTC, datetime
 from typing import Literal, NoReturn
 
 from fastapi import FastAPI, HTTPException, Request, Response, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from xcia.config import RuntimeEnvironment, XciaSettings
 from xcia.policies import BrowserSecurityPolicy
+from xcia.relying_party import WalletRelyingPartyProfile
 from xcia.services import (
     AuthenticationDenied,
     CustomerPinAuthenticationService,
+    DurableAssertionIssuer,
     DurableReadiness,
+    JwksPresenter,
     PhoneProofRequired,
+    SenderConstraintError,
+    UntrustedSessionError,
 )
+from xcia.services.jwks import PrivateKeyExposureError
 
 
 class HealthResponse(BaseModel):
@@ -69,19 +75,52 @@ class AuthenticationResponse(BaseModel):
     status: Literal["authenticated"] = "authenticated"
 
 
+class WalletAssertionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sender_jkt: str = Field(min_length=16, max_length=256)
+
+
+class WalletAssertionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    assertion: str
+    token_type: Literal["DPoP"] = "DPoP"
+    expires_in: Literal[300] = 300
+
+
+class PublicJwksResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    keys: list[dict[str, object]]
+
+
 def create_app(
     settings: XciaSettings | None = None,
     readiness: DurableReadiness | None = None,
     authentication: CustomerPinAuthenticationService | None = None,
+    wallet_assertion_issuer: DurableAssertionIssuer | None = None,
+    wallet_jwks: JwksPresenter | None = None,
 ) -> FastAPI:
     resolved = settings if settings is not None else XciaSettings.from_environment()
     BrowserSecurityPolicy(
         cookie_name=resolved.session_cookie_name,
         samesite=resolved.session_cookie_samesite,
     )
+    wallet_profile = WalletRelyingPartyProfile.from_settings(resolved)
+    if wallet_assertion_issuer is not None:
+        issuer_settings = wallet_assertion_issuer.settings
+        if (
+            issuer_settings.issuer != wallet_profile.issuer
+            or issuer_settings.audience != wallet_profile.audience
+            or issuer_settings.assertion_lifetime_seconds
+            != wallet_profile.assertion_lifetime_seconds
+        ):
+            raise ValueError("Wallet assertion issuer trust configuration mismatch")
 
     app = FastAPI(title="XafPay XCIA", version="0.2.0")
     app.state.xcia_settings = resolved
+    app.state.wallet_relying_party_profile = wallet_profile
 
     def require_bff_request(request: Request) -> None:
         origin = request.headers.get("origin")
@@ -97,6 +136,22 @@ def create_app(
                 detail="authentication unavailable",
             )
         return authentication
+
+    def require_wallet_assertion_issuer() -> DurableAssertionIssuer:
+        if wallet_assertion_issuer is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Wallet relying-party assertion service unavailable",
+            )
+        return wallet_assertion_issuer
+
+    def require_wallet_jwks() -> JwksPresenter:
+        if wallet_jwks is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Wallet relying-party JWKS unavailable",
+            )
+        return wallet_jwks
 
     def set_session_cookie(response: Response, sid: str) -> None:
         response.set_cookie(
@@ -135,6 +190,45 @@ def create_app(
                 detail="durable readiness dependencies are not ready",
             )
         return HealthResponse(status="ready", environment=resolved.environment.value)
+
+    @app.post(
+        "/bff/relying-parties/wallet/assertion",
+        response_model=WalletAssertionResponse,
+    )
+    def wallet_assertion(
+        request: Request,
+        body: WalletAssertionRequest,
+    ) -> WalletAssertionResponse:
+        require_bff_request(request)
+        sid = request.cookies.get(resolved.session_cookie_name)
+        if sid is None:
+            deny_authentication()
+        issuer = require_wallet_assertion_issuer()
+        try:
+            assertion = issuer.issue(sid=sid, sender_jkt=body.sender_jkt)
+        except UntrustedSessionError:
+            deny_authentication()
+        except SenderConstraintError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="forbidden",
+            ) from exc
+        return WalletAssertionResponse(
+            assertion=assertion,
+            expires_in=300,
+        )
+
+    @app.get("/.well-known/jwks.json", response_model=PublicJwksResponse)
+    def public_jwks() -> PublicJwksResponse:
+        presenter = require_wallet_jwks()
+        try:
+            document = presenter.document()
+        except PrivateKeyExposureError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="JWKS unavailable",
+            ) from exc
+        return PublicJwksResponse.model_validate(document)
 
     @app.post("/bff/auth/enrollment/start", response_model=ChallengeResponse)
     def enrollment_start(request: Request, body: PhoneStartRequest) -> ChallengeResponse:
