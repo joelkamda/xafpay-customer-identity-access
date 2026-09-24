@@ -9,6 +9,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -66,6 +67,30 @@ class SessionRow(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     refresh_family_id: Mapped[str | None] = mapped_column(String(255))
     security_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+
+class WalletSessionHandoffRow(Base):
+    __tablename__ = "xcia_wallet_session_handoffs"
+    __table_args__ = (
+        UniqueConstraint("code_digest", name="uq_xcia_wallet_handoff_code_digest"),
+        Index("ix_xcia_wallet_handoff_expires_at", "expires_at"),
+        Index("ix_xcia_wallet_handoff_session_sid", "session_sid"),
+    )
+
+    auth_completion_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    code_digest: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    session_sid: Mapped[str] = mapped_column(
+        ForeignKey("xcia_sessions.sid", ondelete="CASCADE"),
+        nullable=False,
+    )
+    relying_party: Mapped[str] = mapped_column(String(64), nullable=False)
+    sender_jkt: Mapped[str] = mapped_column(String(256), nullable=False)
+    security_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    trusted_origin: Mapped[str] = mapped_column(String(512), nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    redeemed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reconcile_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class RefreshFamilyRow(Base):

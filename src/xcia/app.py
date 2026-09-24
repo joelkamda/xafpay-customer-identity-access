@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from xcia.config import RuntimeEnvironment, XciaSettings
+from xcia.domain import DurableSessionSnapshot
 from xcia.policies import BrowserSecurityPolicy
 from xcia.relying_party import WalletRelyingPartyProfile
 from xcia.services import (
@@ -14,10 +15,15 @@ from xcia.services import (
     CustomerPinAuthenticationService,
     DurableAssertionIssuer,
     DurableReadiness,
+    HandoffDeniedError,
+    HandoffServiceAuthenticationError,
+    HandoffUnavailableError,
     JwksPresenter,
     PhoneProofRequired,
     SenderConstraintError,
+    TrustedWalletSessionContext,
     UntrustedSessionError,
+    WalletSessionHandoffService,
 )
 from xcia.services.jwks import PrivateKeyExposureError
 
@@ -73,6 +79,42 @@ class AuthenticationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     status: Literal["authenticated"] = "authenticated"
+    auth_completion_id: str
+    handoff_code: str
+    handoff_expires_at: datetime
+
+
+class WalletHandoffRedeemRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    handoff_code: str = Field(min_length=32, max_length=512)
+    sender_jkt: str = Field(min_length=16, max_length=256)
+
+
+class WalletHandoffReconcileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    auth_completion_id: str = Field(min_length=8, max_length=255)
+    sender_jkt: str = Field(min_length=16, max_length=256)
+
+
+class WalletHandoffResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    auth_completion_id: str
+    xcia_session_cookie_name: str
+    xcia_session_cookie_value: str
+    auth_time: datetime
+    sender_jkt: str
+    security_version: int
+    authoritative_xcia_idle_expires_at: datetime
+    authoritative_xcia_absolute_expires_at: datetime
+
+
+class LogoutResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["logged_out"] = "logged_out"
 
 
 class WalletAssertionRequest(BaseModel):
@@ -101,6 +143,7 @@ def create_app(
     authentication: CustomerPinAuthenticationService | None = None,
     wallet_assertion_issuer: DurableAssertionIssuer | None = None,
     wallet_jwks: JwksPresenter | None = None,
+    wallet_session_handoff: WalletSessionHandoffService | None = None,
 ) -> FastAPI:
     resolved = settings if settings is not None else XciaSettings.from_environment()
     BrowserSecurityPolicy(
@@ -153,6 +196,30 @@ def create_app(
             )
         return wallet_jwks
 
+    def require_wallet_handoff() -> WalletSessionHandoffService:
+        if wallet_session_handoff is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Wallet trusted handoff unavailable",
+            )
+        return wallet_session_handoff
+
+    def trusted_origin(request: Request) -> str:
+        origin = request.headers.get("origin")
+        if origin not in resolved.trusted_origins:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+        return origin
+
+    def presented_service_token(request: Request) -> str:
+        authorization = request.headers.get("authorization", "")
+        prefix = "Bearer "
+        if not authorization.startswith(prefix):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
+        token = authorization[len(prefix):]
+        if not token:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
+        return token
+
     def set_session_cookie(response: Response, sid: str) -> None:
         response.set_cookie(
             key=resolved.session_cookie_name,
@@ -167,6 +234,21 @@ def create_app(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="authentication_failed",
+        )
+
+    def authentication_response(
+        request: Request,
+        session: DurableSessionSnapshot,
+    ) -> AuthenticationResponse:
+        snapshot = session
+        handoff = require_wallet_handoff().issue(
+            session=snapshot,
+            trusted_origin=trusted_origin(request),
+        )
+        return AuthenticationResponse(
+            auth_completion_id=handoff.auth_completion_id,
+            handoff_code=handoff.handoff_code,
+            handoff_expires_at=handoff.handoff_expires_at,
         )
 
     @app.get("/health/live", response_model=HealthResponse)
@@ -270,7 +352,7 @@ def create_app(
         except (AuthenticationDenied, ValueError):
             deny_authentication()
         set_session_cookie(response, result.session.sid)
-        return AuthenticationResponse()
+        return authentication_response(request, result.session)
 
     @app.post("/bff/auth/login", response_model=AuthenticationResponse)
     def pin_login(
@@ -294,7 +376,7 @@ def create_app(
         except (AuthenticationDenied, PhoneProofRequired, ValueError):
             deny_authentication()
         set_session_cookie(response, result.session.sid)
-        return AuthenticationResponse()
+        return authentication_response(request, result.session)
 
     @app.post("/bff/auth/recovery/start", response_model=ChallengeResponse)
     def recovery_start(request: Request, body: PhoneStartRequest) -> ChallengeResponse:
@@ -324,7 +406,7 @@ def create_app(
         except (AuthenticationDenied, ValueError):
             deny_authentication()
         set_session_cookie(response, result.session.sid)
-        return AuthenticationResponse()
+        return authentication_response(request, result.session)
 
     @app.post("/bff/auth/device/step-up", response_model=AuthenticationResponse)
     def device_step_up(
@@ -333,5 +415,102 @@ def create_app(
         body: PinLoginRequest,
     ) -> AuthenticationResponse:
         return pin_login(request, response, body)
+
+    def handoff_response(context: TrustedWalletSessionContext) -> WalletHandoffResponse:
+        return WalletHandoffResponse(
+            auth_completion_id=context.auth_completion_id,
+            xcia_session_cookie_name=context.xcia_session_cookie_name,
+            xcia_session_cookie_value=context.xcia_session_cookie_value,
+            auth_time=context.auth_time,
+            sender_jkt=context.sender_jkt,
+            security_version=context.security_version,
+            authoritative_xcia_idle_expires_at=context.authoritative_xcia_idle_expires_at,
+            authoritative_xcia_absolute_expires_at=context.authoritative_xcia_absolute_expires_at,
+        )
+
+    @app.post(
+        "/internal/relying-parties/wallet/session-handoffs/redeem",
+        response_model=WalletHandoffResponse,
+    )
+    def redeem_wallet_handoff(
+        request: Request,
+        body: WalletHandoffRedeemRequest,
+    ) -> WalletHandoffResponse:
+        service = require_wallet_handoff()
+        try:
+            context = service.redeem(
+                handoff_code=body.handoff_code,
+                sender_jkt=body.sender_jkt,
+                trusted_origin=trusted_origin(request),
+                presented_service_token=presented_service_token(request),
+            )
+        except HandoffServiceAuthenticationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="unauthorized",
+            ) from exc
+        except HandoffDeniedError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="handoff_denied",
+            ) from exc
+        except HandoffUnavailableError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="handoff_unavailable",
+            ) from exc
+        return handoff_response(context)
+
+    @app.post(
+        "/internal/relying-parties/wallet/session-handoffs/reconcile",
+        response_model=WalletHandoffResponse,
+    )
+    def reconcile_wallet_handoff(
+        request: Request,
+        body: WalletHandoffReconcileRequest,
+    ) -> WalletHandoffResponse:
+        service = require_wallet_handoff()
+        try:
+            context = service.reconcile(
+                auth_completion_id=body.auth_completion_id,
+                sender_jkt=body.sender_jkt,
+                trusted_origin=trusted_origin(request),
+                presented_service_token=presented_service_token(request),
+            )
+        except HandoffServiceAuthenticationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="unauthorized",
+            ) from exc
+        except HandoffDeniedError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="handoff_denied",
+            ) from exc
+        except HandoffUnavailableError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="handoff_unavailable",
+            ) from exc
+        return handoff_response(context)
+
+    @app.post("/bff/auth/logout", response_model=LogoutResponse)
+    def logout(
+        request: Request,
+        response: Response,
+    ) -> LogoutResponse:
+        require_bff_request(request)
+        sid = request.cookies.get(resolved.session_cookie_name)
+        if sid is not None:
+            service = require_authentication()
+            service.sessions.revoke_session(sid)
+        response.delete_cookie(
+            key=resolved.session_cookie_name,
+            path="/",
+            secure=True,
+            httponly=True,
+            samesite="lax",
+        )
+        return LogoutResponse()
 
     return app

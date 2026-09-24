@@ -12,10 +12,13 @@ from xcia.adapters.postgres import (
     DurableRefreshFamilyStore,
     DurableSessionStore,
     DurableSubjectStore,
+    DurableWalletSessionHandoffStore,
     PostgresReplayDefense,
     PostgresRevocationAuthority,
     RefreshReuseDetected,
     SecurityEventStore,
+    WalletSessionHandoffContext,
+    WalletSessionHandoffMaterial,
 )
 
 __all__ = [
@@ -25,6 +28,7 @@ __all__ = [
     "DurablePinCredentialStore",
     "DurableSessionStore",
     "DurableSubjectStore",
+    "DurableWalletSessionHandoffStore",
     "InfobipHttpResponse",
     "InfobipHttpTransport",
     "InfobipPhoneVerificationAdapter",
@@ -32,6 +36,8 @@ __all__ = [
     "PostgresRevocationAuthority",
     "RefreshReuseDetected",
     "SecurityEventStore",
+    "WalletSessionHandoffContext",
+    "WalletSessionHandoffMaterial",
     "UrllibInfobipHttpTransport",
     "compose_phone_verification_provider",
 ]

@@ -27,6 +27,11 @@ class XciaSettings(BaseSettings):
     session_cookie_samesite: str = "lax"
     assertion_lifetime_seconds: int = 300
     clock_skew_seconds: int = 60
+    wallet_web_handoff_service_token: str | None = Field(
+        default=None,
+        min_length=32,
+        max_length=4096,
+    )
 
     @field_validator("trusted_origins")
     @classmethod

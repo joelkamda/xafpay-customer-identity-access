@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, select, update
@@ -28,6 +29,7 @@ from xcia.persistence.schema import (
     SessionRow,
     SigningKeyRow,
     TrustedDeviceRow,
+    WalletSessionHandoffRow,
 )
 from xcia.policies import SubjectPolicy
 
@@ -278,6 +280,233 @@ class DurableSessionStore:
         moment = at if at is not None else datetime.now(UTC)
         snapshot = self.get_session(sid)
         return snapshot is None or not snapshot.is_active(moment)
+
+
+@dataclass(frozen=True, slots=True)
+class WalletSessionHandoffMaterial:
+    auth_completion_id: str
+    handoff_code: str
+    handoff_expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class WalletSessionHandoffContext:
+    auth_completion_id: str
+    session_sid: str
+    auth_time: datetime
+    sender_jkt: str
+    security_version: int
+    idle_expires_at: datetime
+    absolute_expires_at: datetime
+
+
+class DurableWalletSessionHandoffStore:
+    HANDOFF_TTL_SECONDS = 60
+    RECONCILIATION_WINDOW_SECONDS = 120
+
+    def __init__(self, database: XciaDatabase) -> None:
+        self._database = database
+
+    @staticmethod
+    def _moment(now: datetime | None) -> datetime:
+        moment = now if now is not None else datetime.now(UTC)
+        if moment.tzinfo is None:
+            raise ValueError("handoff time must be timezone aware")
+        return moment
+
+    @staticmethod
+    def _code_digest(handoff_code: str) -> bytes:
+        if not handoff_code:
+            raise ValueError("handoff code is required")
+        return hashlib.sha256(handoff_code.encode("utf-8")).digest()
+
+    @staticmethod
+    def _context(
+        row: WalletSessionHandoffRow,
+        session_row: SessionRow,
+    ) -> WalletSessionHandoffContext:
+        return WalletSessionHandoffContext(
+            auth_completion_id=row.auth_completion_id,
+            session_sid=session_row.sid,
+            auth_time=session_row.auth_time,
+            sender_jkt=session_row.sender_jkt,
+            security_version=session_row.security_version,
+            idle_expires_at=session_row.idle_expires_at,
+            absolute_expires_at=session_row.absolute_expires_at,
+        )
+
+    @staticmethod
+    def _require_binding(
+        row: WalletSessionHandoffRow,
+        session_row: SessionRow,
+        *,
+        relying_party: str,
+        sender_jkt: str,
+        trusted_origin: str,
+        moment: datetime,
+    ) -> None:
+        snapshot = DurableSessionStore.snapshot_from_row(session_row)
+        if not snapshot.is_active(moment):
+            raise ValueError("XCIA session is not active")
+        if row.relying_party != relying_party:
+            raise ValueError("handoff relying party mismatch")
+        if row.trusted_origin != trusted_origin:
+            raise ValueError("handoff trusted origin mismatch")
+        if row.sender_jkt != sender_jkt or session_row.sender_jkt != sender_jkt:
+            raise ValueError("handoff sender binding mismatch")
+        if session_row.security_version != row.security_version:
+            raise ValueError("handoff security version mismatch")
+
+    def issue(
+        self,
+        *,
+        session_sid: str,
+        relying_party: str,
+        sender_jkt: str,
+        security_version: int,
+        trusted_origin: str,
+        now: datetime | None = None,
+    ) -> WalletSessionHandoffMaterial:
+        moment = self._moment(now)
+        auth_completion_id = f"ac_{secrets.token_urlsafe(16)}"
+        handoff_code = secrets.token_urlsafe(32)
+        expires_at = moment + timedelta(seconds=self.HANDOFF_TTL_SECONDS)
+
+        with self._database.session() as session:
+            with session.begin():
+                session_row = session.scalar(
+                    select(SessionRow)
+                    .where(SessionRow.sid == session_sid)
+                    .with_for_update()
+                )
+                if session_row is None:
+                    raise ValueError("XCIA session is missing")
+                snapshot = DurableSessionStore.snapshot_from_row(session_row)
+                if not snapshot.is_active(moment):
+                    raise ValueError("XCIA session is not active")
+                if session_row.sender_jkt != sender_jkt:
+                    raise ValueError("XCIA session sender binding mismatch")
+                if session_row.security_version != security_version:
+                    raise ValueError("XCIA session security version mismatch")
+                session.add(
+                    WalletSessionHandoffRow(
+                        auth_completion_id=auth_completion_id,
+                        code_digest=self._code_digest(handoff_code),
+                        session_sid=session_sid,
+                        relying_party=relying_party,
+                        sender_jkt=sender_jkt,
+                        security_version=security_version,
+                        trusted_origin=trusted_origin,
+                        issued_at=moment,
+                        expires_at=expires_at,
+                        redeemed_at=None,
+                        reconcile_expires_at=None,
+                    )
+                )
+                session.flush()
+
+        return WalletSessionHandoffMaterial(
+            auth_completion_id=auth_completion_id,
+            handoff_code=handoff_code,
+            handoff_expires_at=expires_at,
+        )
+
+    def redeem(
+        self,
+        *,
+        handoff_code: str,
+        relying_party: str,
+        sender_jkt: str,
+        trusted_origin: str,
+        now: datetime | None = None,
+    ) -> WalletSessionHandoffContext:
+        moment = self._moment(now)
+        code_digest = self._code_digest(handoff_code)
+
+        with self._database.session() as session:
+            with session.begin():
+                row = session.scalar(
+                    select(WalletSessionHandoffRow)
+                    .where(WalletSessionHandoffRow.code_digest == code_digest)
+                    .with_for_update()
+                )
+                if row is None:
+                    raise ValueError("handoff is missing")
+                if row.redeemed_at is not None:
+                    raise ValueError("handoff is already redeemed")
+                if moment >= row.expires_at:
+                    raise ValueError("handoff is expired")
+
+                session_row = session.scalar(
+                    select(SessionRow)
+                    .where(SessionRow.sid == row.session_sid)
+                    .with_for_update()
+                )
+                if session_row is None:
+                    raise ValueError("XCIA session is missing")
+                self._require_binding(
+                    row,
+                    session_row,
+                    relying_party=relying_party,
+                    sender_jkt=sender_jkt,
+                    trusted_origin=trusted_origin,
+                    moment=moment,
+                )
+                row.redeemed_at = moment
+                row.reconcile_expires_at = min(
+                    moment + timedelta(seconds=self.RECONCILIATION_WINDOW_SECONDS),
+                    session_row.idle_expires_at,
+                    session_row.absolute_expires_at,
+                )
+                session.flush()
+                return self._context(row, session_row)
+
+    def reconcile(
+        self,
+        *,
+        auth_completion_id: str,
+        relying_party: str,
+        sender_jkt: str,
+        trusted_origin: str,
+        now: datetime | None = None,
+    ) -> WalletSessionHandoffContext:
+        moment = self._moment(now)
+        if not auth_completion_id.startswith("ac_"):
+            raise ValueError("authentication completion id is invalid")
+
+        with self._database.session() as session:
+            with session.begin():
+                row = session.scalar(
+                    select(WalletSessionHandoffRow)
+                    .where(
+                        WalletSessionHandoffRow.auth_completion_id == auth_completion_id
+                    )
+                    .with_for_update()
+                )
+                if row is None or row.redeemed_at is None:
+                    raise ValueError("redeemed handoff is missing")
+                if (
+                    row.reconcile_expires_at is None
+                    or moment >= row.reconcile_expires_at
+                ):
+                    raise ValueError("handoff reconciliation window is expired")
+
+                session_row = session.scalar(
+                    select(SessionRow)
+                    .where(SessionRow.sid == row.session_sid)
+                    .with_for_update()
+                )
+                if session_row is None:
+                    raise ValueError("XCIA session is missing")
+                self._require_binding(
+                    row,
+                    session_row,
+                    relying_party=relying_party,
+                    sender_jkt=sender_jkt,
+                    trusted_origin=trusted_origin,
+                    moment=moment,
+                )
+                return self._context(row, session_row)
 
 
 class DurableRefreshFamilyStore:

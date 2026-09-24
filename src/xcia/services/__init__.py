@@ -5,6 +5,13 @@ from xcia.services.authentication import (
     CustomerPinAuthenticationService,
     PhoneProofRequired,
 )
+from xcia.services.handoffs import (
+    HandoffDeniedError,
+    HandoffServiceAuthenticationError,
+    HandoffUnavailableError,
+    TrustedWalletSessionContext,
+    WalletSessionHandoffService,
+)
 from xcia.services.issuance import (
     DurableAssertionIssuer,
     SenderConstraintError,
@@ -21,9 +28,14 @@ __all__ = [
     "DurableAssertionIssuer",
     "DurableReadiness",
     "DurableReadinessProbe",
+    "HandoffDeniedError",
+    "HandoffServiceAuthenticationError",
+    "HandoffUnavailableError",
     "JwksPresenter",
     "PhoneProofRequired",
     "SenderBindingError",
     "SenderConstraintError",
+    "TrustedWalletSessionContext",
     "UntrustedSessionError",
+    "WalletSessionHandoffService",
 ]
