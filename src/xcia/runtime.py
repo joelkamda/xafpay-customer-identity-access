@@ -20,7 +20,7 @@ from xcia.services import (
     WalletSessionHandoffService,
 )
 
-EXPECTED_REVISION = "fl1f_0001_wallet_session_handoffs"
+EXPECTED_REVISION = "fl1f_0001_wallet_session_handoff"
 def _loaded_private_key(
     provider: StagingEs256KeyProvider,
     kid: str,

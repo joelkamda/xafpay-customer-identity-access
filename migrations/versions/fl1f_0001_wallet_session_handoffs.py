@@ -1,6 +1,6 @@
 """Add FL1F Wallet trusted session handoff persistence.
 
-Revision ID: fl1f_0001_wallet_session_handoffs
+Revision ID: fl1f_0001_wallet_session_handoff
 Revises: xcia3_0001
 Create Date: 2026-09-24
 """
@@ -8,7 +8,7 @@ Create Date: 2026-09-24
 import sqlalchemy as sa
 from alembic import op
 
-revision = "fl1f_0001_wallet_session_handoffs"
+revision = "fl1f_0001_wallet_session_handoff"
 down_revision = "xcia3_0001"
 branch_labels = None
 depends_on = None

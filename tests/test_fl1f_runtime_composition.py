@@ -275,7 +275,8 @@ def test_10_readiness_expected_revision_is_fl1f(
 ) -> None:
     capture = _compose(monkeypatch)
     assert capture["readiness_kwargs"]["expected_revision"] == runtime.EXPECTED_REVISION
-    assert runtime.EXPECTED_REVISION == "fl1f_0001_wallet_session_handoffs"
+    assert runtime.EXPECTED_REVISION == "fl1f_0001_wallet_session_handoff"
+    assert len(runtime.EXPECTED_REVISION) <= 32
 
 
 def test_11_create_app_receives_non_null_readiness(
