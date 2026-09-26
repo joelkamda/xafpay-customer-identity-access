@@ -1,19 +1,29 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import FastAPI
 from sqlalchemy import select
 
-from xcia.adapters import DurableSessionStore, DurableWalletSessionHandoffStore
+from xcia.adapters import (
+    DurableAuthenticationControlStore,
+    DurablePinCredentialStore,
+    DurableSessionStore,
+    DurableSubjectStore,
+    DurableWalletSessionHandoffStore,
+    SecurityEventStore,
+    compose_phone_verification_provider,
+)
 from xcia.app import create_app
-from xcia.config import RuntimeEnvironment, Xcia2RuntimeSettings, XciaSettings
-from xcia.crypto import StagingEs256KeyProvider
+from xcia.config import RuntimeEnvironment, Xcia2RuntimeSettings, Xcia3RuntimeSettings, XciaSettings
+from xcia.crypto import CredentialSecrets, StagingEs256KeyProvider
 from xcia.domain import SigningKeyState
 from xcia.persistence import XciaDatabase
 from xcia.persistence.schema import SigningKeyRow
 from xcia.services import (
+    CustomerPinAuthenticationService,
     DurableAssertionIssuer,
     DurableReadinessProbe,
     JwksPresenter,
@@ -86,6 +96,19 @@ def create_staging_app() -> FastAPI:
         raise ValueError("create_staging_app requires XCIA_ENVIRONMENT=staging")
 
     xcia2 = Xcia2RuntimeSettings()  # pyright: ignore[reportCallIssue]
+    xcia3 = Xcia3RuntimeSettings()  # pyright: ignore[reportCallIssue]
+    credential_secret_value = os.environ.get(xcia3.credential_secret_env)
+    if credential_secret_value is None or not credential_secret_value.strip():
+        raise ValueError("XCIA3 credential root secret is required")
+    credential_secret = credential_secret_value.encode("utf-8")
+    xcia3.validate_for_environment(settings.environment, credential_secret)
+    credential_secrets = CredentialSecrets(credential_secret)
+    phone_provider = compose_phone_verification_provider(
+        settings=xcia3,
+        environment=settings.environment,
+        fake_secret=credential_secrets.derive("xcia3/staging-phone-proof"),
+    )
+
     database = XciaDatabase(xcia2.database_url)
 
     signing_provider = StagingEs256KeyProvider.from_environment(
@@ -103,6 +126,22 @@ def create_staging_app() -> FastAPI:
     )
 
     sessions = DurableSessionStore(database)
+    subjects = DurableSubjectStore(database)
+    credentials = DurablePinCredentialStore(database)
+    controls = DurableAuthenticationControlStore(database)
+    events = SecurityEventStore(database)
+    authentication = CustomerPinAuthenticationService(
+        settings=settings,
+        xcia3=xcia3,
+        secrets=credential_secrets,
+        phone_provider=phone_provider,
+        subjects=subjects,
+        sessions=sessions,
+        credentials=credentials,
+        controls=controls,
+        events=events,
+    )
+
     assertion_issuer = DurableAssertionIssuer(
         settings,
         sessions,
@@ -124,6 +163,7 @@ def create_staging_app() -> FastAPI:
     return create_app(
         settings=settings,
         readiness=readiness,
+        authentication=authentication,
         wallet_assertion_issuer=assertion_issuer,
         wallet_jwks=jwks_presenter,
         wallet_session_handoff=handoff_service,

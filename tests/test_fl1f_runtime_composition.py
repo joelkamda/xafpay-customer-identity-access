@@ -10,7 +10,9 @@ import pytest
 from fastapi import FastAPI
 
 from xcia import runtime
-from xcia.config import RuntimeEnvironment, Xcia2RuntimeSettings, XciaSettings
+from xcia.adapters import DeterministicFakePhoneVerificationAdapter
+from xcia.config import RuntimeEnvironment, Xcia2RuntimeSettings, Xcia3RuntimeSettings, XciaSettings
+from xcia.crypto import CredentialSecrets
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_SOURCE = ROOT / "src/xcia/runtime.py"
@@ -19,6 +21,8 @@ ACCEPTED_APP_SHA256 = "ac280658cf16e47136aaaaeb0c77a4bce98fdd50026f2815cf9a3a4fd
 TEST_ORIGIN = "https://wallet-web.staging.test"
 TEST_KID = "xcia-test-signing-key-01"
 TEST_KEY_ENV = "XCIA_R2_TEST_SIGNING_PRIVATE_KEY"
+TEST_CREDENTIAL_ENV = "XCIA_R1A_R2_TEST_CREDENTIAL_SECRET"
+TEST_CREDENTIAL_SECRET = "C" * 32
 
 
 def _set_staging_env(
@@ -35,6 +39,9 @@ def _set_staging_env(
         "XCIA2_SIGNING_KEY_KID": TEST_KID,
         "XCIA2_SIGNING_PRIVATE_KEY_ENV": TEST_KEY_ENV,
         TEST_KEY_ENV: "test-private-key-placeholder",
+        "XCIA3_CREDENTIAL_SECRET_ENV": TEST_CREDENTIAL_ENV,
+        TEST_CREDENTIAL_ENV: TEST_CREDENTIAL_SECRET,
+        "XCIA3_PHONE_PROVIDER": "deterministic_fake",
     }
     if include_handoff_token:
         values["XCIA_WALLET_WEB_HANDOFF_SERVICE_TOKEN"] = "T" * 32
@@ -48,10 +55,12 @@ def _install_composition_fakes(
     monkeypatch: pytest.MonkeyPatch,
     *,
     patch_handoff_service: bool = True,
+    patch_phone_provider: bool = True,
 ) -> dict[str, Any]:
-    capture: dict[str, Any] = {}
+    capture: dict[str, Any] = {"database_call_count": 0, "session_store_call_count": 0}
 
     def database_factory(url: str) -> object:
+        capture["database_call_count"] += 1
         database = SimpleNamespace(url=url)
         capture["database"] = database
         return database
@@ -68,10 +77,47 @@ def _install_composition_fakes(
         capture["bootstrap"] = kwargs
 
     def session_store(database: object) -> object:
+        capture["session_store_call_count"] += 1
         store = SimpleNamespace()
         capture["session_store"] = store
         capture["session_store_database"] = database
         return store
+
+    def subject_store(database: object) -> object:
+        store = SimpleNamespace()
+        capture["subject_store"] = store
+        capture["subject_store_database"] = database
+        return store
+
+    def pin_store(database: object) -> object:
+        store = SimpleNamespace()
+        capture["pin_store"] = store
+        capture["pin_store_database"] = database
+        return store
+
+    def auth_control_store(database: object) -> object:
+        store = SimpleNamespace()
+        capture["auth_control_store"] = store
+        capture["auth_control_store_database"] = database
+        return store
+
+    def security_event_store(database: object) -> object:
+        store = SimpleNamespace()
+        capture["security_event_store"] = store
+        capture["security_event_store_database"] = database
+        return store
+
+    def phone_provider_factory(**kwargs: object) -> object:
+        provider = SimpleNamespace()
+        capture["phone_provider"] = provider
+        capture["phone_provider_kwargs"] = kwargs
+        return provider
+
+    def authentication_service(**kwargs: object) -> object:
+        service = SimpleNamespace()
+        capture["authentication_service"] = service
+        capture["authentication_kwargs"] = kwargs
+        return service
 
     def assertion_issuer(
         settings: XciaSettings,
@@ -118,6 +164,13 @@ def _install_composition_fakes(
     monkeypatch.setattr(runtime, "StagingEs256KeyProvider", ProviderFactory)
     monkeypatch.setattr(runtime, "_qualify_or_bootstrap_signing_authority", bootstrap)
     monkeypatch.setattr(runtime, "DurableSessionStore", session_store)
+    monkeypatch.setattr(runtime, "DurableSubjectStore", subject_store)
+    monkeypatch.setattr(runtime, "DurablePinCredentialStore", pin_store)
+    monkeypatch.setattr(runtime, "DurableAuthenticationControlStore", auth_control_store)
+    monkeypatch.setattr(runtime, "SecurityEventStore", security_event_store)
+    if patch_phone_provider:
+        monkeypatch.setattr(runtime, "compose_phone_verification_provider", phone_provider_factory)
+    monkeypatch.setattr(runtime, "CustomerPinAuthenticationService", authentication_service)
     monkeypatch.setattr(runtime, "DurableAssertionIssuer", assertion_issuer)
     monkeypatch.setattr(runtime, "JwksPresenter", jwks_presenter)
     monkeypatch.setattr(runtime, "DurableWalletSessionHandoffStore", handoff_store)
@@ -471,10 +524,15 @@ def test_33_runtime_does_not_invent_new_wallet_web_origin() -> None:
     assert "https://" not in _runtime_text()
 
 
-def test_34_startup_creates_no_identity() -> None:
+def test_34_startup_composes_identity_stores_without_creating_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = _compose(monkeypatch)
+    assert capture["subject_store_database"] is capture["database"]
+    assert capture["pin_store_database"] is capture["database"]
     source = _runtime_text()
-    assert "DurableSubjectStore" not in source
-    assert "CustomerPinCredential" not in source
+    assert "subjects.create_or_lookup(" not in source
+    assert "credentials.replace(" not in source
 
 
 def test_35_startup_creates_no_session() -> None:
@@ -491,10 +549,121 @@ def test_37_startup_issues_no_wallet_assertion() -> None:
     assert "assertion_issuer.issue(" not in _runtime_text()
 
 
-def test_38_startup_calls_no_infobip_provider() -> None:
-    source = _runtime_text()
-    assert "Infobip" not in source
-    assert "compose_phone_verification_provider" not in source
+def test_38_staging_composes_deterministic_fake_without_infobip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_staging_env(monkeypatch)
+    capture = _install_composition_fakes(monkeypatch, patch_phone_provider=False)
+    runtime.create_staging_app()
+    provider = capture["authentication_kwargs"]["phone_provider"]
+    assert isinstance(provider, DeterministicFakePhoneVerificationAdapter)
+    assert "Infobip" not in _runtime_text()
+
+
 def test_39_existing_xcia_app_source_remains_unchanged() -> None:
     digest = hashlib.sha256(APP_SOURCE.read_bytes()).hexdigest()
     assert digest == ACCEPTED_APP_SHA256
+
+
+def test_40_xcia3_settings_and_credential_secrets_are_composed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = _compose(monkeypatch)
+    kwargs = capture["authentication_kwargs"]
+    assert isinstance(kwargs["xcia3"], Xcia3RuntimeSettings)
+    secrets = kwargs["secrets"]
+    assert isinstance(secrets, CredentialSecrets)
+    assert secrets.root_secret == TEST_CREDENTIAL_SECRET.encode("utf-8")
+
+
+@pytest.mark.parametrize("secret", [None, "", "short"])
+def test_41_invalid_credential_root_secret_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    secret: str | None,
+) -> None:
+    _set_staging_env(monkeypatch)
+    _install_composition_fakes(monkeypatch)
+    if secret is None:
+        monkeypatch.delenv(TEST_CREDENTIAL_ENV)
+    else:
+        monkeypatch.setenv(TEST_CREDENTIAL_ENV, secret)
+    with pytest.raises(ValueError):
+        runtime.create_staging_app()
+
+
+def test_42_staging_phone_proof_uses_domain_separated_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = _compose(monkeypatch)
+    provider_kwargs = capture["phone_provider_kwargs"]
+    expected = CredentialSecrets(TEST_CREDENTIAL_SECRET.encode("utf-8")).derive(
+        "xcia3/staging-phone-proof"
+    )
+    assert provider_kwargs["fake_secret"] == expected
+    assert provider_kwargs["fake_secret"] != TEST_CREDENTIAL_SECRET.encode("utf-8")
+    assert provider_kwargs["environment"] is RuntimeEnvironment.STAGING
+    assert provider_kwargs["settings"] is capture["authentication_kwargs"]["xcia3"]
+
+
+def test_43_all_authentication_stores_share_the_existing_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = _compose(monkeypatch)
+    database = capture["database"]
+    assert capture["subject_store_database"] is database
+    assert capture["pin_store_database"] is database
+    assert capture["auth_control_store_database"] is database
+    assert capture["security_event_store_database"] is database
+    assert capture["database_call_count"] == 1
+
+
+def test_44_authentication_service_receives_exact_composed_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = _compose(monkeypatch)
+    kwargs = capture["authentication_kwargs"]
+    assert kwargs["settings"] is capture["create_app_kwargs"]["settings"]
+    assert kwargs["phone_provider"] is capture["phone_provider"]
+    assert kwargs["subjects"] is capture["subject_store"]
+    assert kwargs["sessions"] is capture["session_store"]
+    assert kwargs["credentials"] is capture["pin_store"]
+    assert kwargs["controls"] is capture["auth_control_store"]
+    assert kwargs["events"] is capture["security_event_store"]
+    assert capture["session_store_call_count"] == 1
+
+
+def test_45_create_app_receives_authentication_and_existing_runtime_services(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = _compose(monkeypatch)
+    app_kwargs = capture["create_app_kwargs"]
+    assert app_kwargs["authentication"] is capture["authentication_service"]
+    assert app_kwargs["wallet_assertion_issuer"] is capture["assertion_issuer"]
+    assert app_kwargs["wallet_jwks"] is capture["jwks"]
+    assert app_kwargs["wallet_session_handoff"] is capture["handoff_service"]
+    assert app_kwargs["readiness"] is capture["readiness"]
+
+
+def test_46_provider_selection_remains_configuration_driven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = _compose(monkeypatch)
+    settings = capture["phone_provider_kwargs"]["settings"]
+    assert isinstance(settings, Xcia3RuntimeSettings)
+    assert settings.phone_provider == "deterministic_fake"
+    source = _runtime_text()
+    assert "DeterministicFakePhoneVerificationAdapter(" not in source
+    assert "InfobipPhoneVerificationAdapter(" not in source
+
+
+def test_47_runtime_composition_starts_no_phone_challenge_or_authentication_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_staging_env(monkeypatch)
+    capture = _install_composition_fakes(monkeypatch, patch_phone_provider=False)
+    runtime.create_staging_app()
+    provider = capture["authentication_kwargs"]["phone_provider"]
+    assert isinstance(provider, DeterministicFakePhoneVerificationAdapter)
+    source = _runtime_text()
+    assert ".start_phone_verification(" not in source
+    assert ".enroll(" not in source
