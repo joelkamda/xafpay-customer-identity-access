@@ -6,6 +6,7 @@ from typing import Literal, NoReturn
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from xcia.adapters.postgres import PhoneVerificationChallengeError
 from xcia.config import RuntimeEnvironment, XciaSettings
 from xcia.domain import DurableSessionSnapshot
 from xcia.policies import BrowserSecurityPolicy
@@ -82,6 +83,13 @@ class AuthenticationResponse(BaseModel):
     auth_completion_id: str
     handoff_code: str
     handoff_expires_at: datetime
+
+
+class EnrollmentDispositionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["account_already_exists", "recovery_required"]
+    next_action: Literal["sign_in_or_recovery", "account_recovery"]
 
 
 class WalletHandoffRedeemRequest(BaseModel):
@@ -236,6 +244,17 @@ def create_app(
             detail="authentication_failed",
         )
 
+    def deny_challenge(exc: PhoneVerificationChallengeError) -> NoReturn:
+        code = str(exc)
+        if code in {
+            "challenge_phone_mismatch",
+            "challenge_expired",
+            "challenge_not_verified",
+            "challenge_consumed",
+        }:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=code) from exc
+        deny_authentication()
+
     def authentication_response(
         request: Request,
         session: DurableSessionSnapshot,
@@ -327,17 +346,27 @@ def create_app(
         require_bff_request(request)
         service = require_authentication()
         try:
-            service.verify_phone_proof(body.challenge_id, body.proof, now=datetime.now(UTC))
+            service.verify_phone_proof(
+                body.phone,
+                body.challenge_id,
+                body.proof,
+                now=datetime.now(UTC),
+            )
+        except PhoneVerificationChallengeError as exc:
+            deny_challenge(exc)
         except (AuthenticationDenied, ValueError):
             deny_authentication()
         return VerificationResponse()
 
-    @app.post("/bff/auth/enrollment/complete", response_model=AuthenticationResponse)
+    @app.post(
+        "/bff/auth/enrollment/complete",
+        response_model=AuthenticationResponse | EnrollmentDispositionResponse,
+    )
     def enrollment_complete(
         request: Request,
         response: Response,
         body: PinAuthenticationRequest,
-    ) -> AuthenticationResponse:
+    ) -> AuthenticationResponse | EnrollmentDispositionResponse:
         require_bff_request(request)
         service = require_authentication()
         try:
@@ -348,11 +377,26 @@ def create_app(
                 pin=body.pin,
                 sender_jkt=body.sender_jkt,
                 device_id=body.device_id,
+                completion_origin=trusted_origin(request),
             )
+        except PhoneVerificationChallengeError as exc:
+            deny_challenge(exc)
         except (AuthenticationDenied, ValueError):
             deny_authentication()
-        set_session_cookie(response, result.session.sid)
-        return authentication_response(request, result.session)
+        if result.outcome == "account_already_exists":
+            return EnrollmentDispositionResponse(
+                status="account_already_exists",
+                next_action="sign_in_or_recovery",
+            )
+        if result.outcome == "recovery_required":
+            return EnrollmentDispositionResponse(
+                status="recovery_required",
+                next_action="account_recovery",
+            )
+        if result.authentication is None:
+            deny_authentication()
+        set_session_cookie(response, result.authentication.session.sid)
+        return authentication_response(request, result.authentication.session)
 
     @app.post("/bff/auth/login", response_model=AuthenticationResponse)
     def pin_login(

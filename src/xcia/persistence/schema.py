@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -167,6 +168,12 @@ class CustomerPinCredentialRow(Base):
             "credential_version",
             name="uq_xcia_pin_phone_lookup_version",
         ),
+        Index(
+            "uq_xcia_pin_active_phone",
+            "phone_lookup_digest",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
     )
 
     credential_id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -186,6 +193,39 @@ class CustomerPinCredentialRow(Base):
     failed_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PhoneVerificationChallengeRow(Base):
+    __tablename__ = "xcia_phone_verification_challenges"
+    __table_args__ = (
+        UniqueConstraint("challenge_id", name="uq_xcia_phone_challenge_id"),
+        Index("ix_xcia_phone_challenge_expires_at", "expires_at"),
+        Index(
+            "uq_xcia_phone_challenge_active_phone",
+            "bound_phone_digest",
+            unique=True,
+            postgresql_where=text("state IN ('issued', 'verified')"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    challenge_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    bound_phone_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    verify_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completion_outcome: Mapped[str | None] = mapped_column(String(64))
+    completed_subject_id: Mapped[str | None] = mapped_column(String(36))
+    completed_session_sid: Mapped[str | None] = mapped_column(String(255))
+    completion_sender_jkt_digest: Mapped[str | None] = mapped_column(String(64))
+    completion_device_digest: Mapped[str | None] = mapped_column(String(64))
+    completion_origin: Mapped[str | None] = mapped_column(String(512))
 
 
 class AuthenticationBucketRow(Base):

@@ -23,6 +23,7 @@ from xcia.persistence.schema import (
     AuthenticationBucketRow,
     CustomerPinCredentialRow,
     CustomerSubjectRow,
+    PhoneVerificationChallengeRow,
     RefreshFamilyRow,
     ReplayJtiRow,
     SecurityEventRow,
@@ -771,6 +772,299 @@ class SecurityEventStore:
                 )
 
 
+@dataclass(frozen=True, slots=True)
+class EnrollmentCompletionRecord:
+    outcome: str
+    session: DurableSessionSnapshot | None = None
+    subject_id: str | None = None
+
+
+class PhoneVerificationChallengeError(ValueError):
+    pass
+
+
+class DurablePhoneVerificationChallengeStore:
+    ACTIVE_STATES = ("issued", "verified")
+
+    def __init__(self, database: XciaDatabase) -> None:
+        self._database = database
+
+    def register(
+        self,
+        *,
+        challenge_id: str,
+        provider: str,
+        bound_phone_digest: str,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> None:
+        with self._database.session() as session:
+            with session.begin():
+                active = list(
+                    session.scalars(
+                        select(PhoneVerificationChallengeRow)
+                        .where(
+                            PhoneVerificationChallengeRow.bound_phone_digest == bound_phone_digest,
+                            PhoneVerificationChallengeRow.state.in_(self.ACTIVE_STATES),
+                        )
+                        .with_for_update()
+                    )
+                )
+                for row in active:
+                    row.state = "superseded"
+                    row.superseded_at = created_at
+                    row.updated_at = created_at
+                session.add(
+                    PhoneVerificationChallengeRow(
+                        id=str(uuid.uuid4()),
+                        challenge_id=challenge_id,
+                        provider=provider,
+                        bound_phone_digest=bound_phone_digest,
+                        state="issued",
+                        created_at=created_at,
+                        expires_at=expires_at,
+                        verified_at=None,
+                        consumed_at=None,
+                        superseded_at=None,
+                        updated_at=created_at,
+                        verify_attempt_count=0,
+                        completion_outcome=None,
+                        completed_subject_id=None,
+                        completed_session_sid=None,
+                        completion_sender_jkt_digest=None,
+                        completion_device_digest=None,
+                        completion_origin=None,
+                    )
+                )
+
+    def verify(
+        self,
+        *,
+        challenge_id: str,
+        bound_phone_digest: str,
+        proof: str,
+        now: datetime,
+        provider_verify,
+    ) -> None:
+        with self._database.session() as session:
+            with session.begin():
+                row = session.scalar(
+                    select(PhoneVerificationChallengeRow)
+                    .where(PhoneVerificationChallengeRow.challenge_id == challenge_id)
+                    .with_for_update()
+                )
+                if row is None:
+                    raise PhoneVerificationChallengeError("authentication_failed")
+                if row.bound_phone_digest != bound_phone_digest:
+                    raise PhoneVerificationChallengeError("challenge_phone_mismatch")
+                if now >= row.expires_at:
+                    if row.state not in {"consumed", "expired", "superseded"}:
+                        row.state = "expired"
+                        row.updated_at = now
+                    raise PhoneVerificationChallengeError("challenge_expired")
+                if row.state == "verified":
+                    return
+                if row.state == "consumed":
+                    raise PhoneVerificationChallengeError("challenge_consumed")
+                if row.state in {"expired", "superseded"}:
+                    raise PhoneVerificationChallengeError(
+                        "challenge_expired" if row.state == "expired" else "authentication_failed"
+                    )
+                if row.state != "issued":
+                    raise PhoneVerificationChallengeError("authentication_failed")
+                row.verify_attempt_count += 1
+                row.updated_at = now
+                if not provider_verify(challenge_id, proof, now=now):
+                    raise PhoneVerificationChallengeError("authentication_failed")
+                row.state = "verified"
+                row.verified_at = now
+                row.updated_at = now
+
+    def require_verified(
+        self,
+        *,
+        challenge_id: str,
+        bound_phone_digest: str,
+        now: datetime,
+    ) -> None:
+        with self._database.session() as session:
+            row = session.scalar(
+                select(PhoneVerificationChallengeRow).where(
+                    PhoneVerificationChallengeRow.challenge_id == challenge_id
+                )
+            )
+            if row is None:
+                raise PhoneVerificationChallengeError("authentication_failed")
+            if row.bound_phone_digest != bound_phone_digest:
+                raise PhoneVerificationChallengeError("challenge_phone_mismatch")
+            if now >= row.expires_at or row.state == "expired":
+                raise PhoneVerificationChallengeError("challenge_expired")
+            if row.state == "consumed":
+                raise PhoneVerificationChallengeError("challenge_consumed")
+            if row.state != "verified" or row.verified_at is None:
+                raise PhoneVerificationChallengeError("challenge_not_verified")
+
+    def complete_new_customer(
+        self,
+        *,
+        challenge_id: str,
+        bound_phone_digest: str,
+        mapping_digest: str,
+        relying_party: str,
+        environment: str,
+        verifier: str,
+        sender_jkt: str,
+        sender_jkt_digest: str,
+        device_digest: str,
+        completion_origin: str,
+        now: datetime,
+    ) -> EnrollmentCompletionRecord:
+        with self._database.session() as session:
+            with session.begin():
+                challenge = session.scalar(
+                    select(PhoneVerificationChallengeRow)
+                    .where(PhoneVerificationChallengeRow.challenge_id == challenge_id)
+                    .with_for_update()
+                )
+                if challenge is None:
+                    raise PhoneVerificationChallengeError("authentication_failed")
+                if challenge.bound_phone_digest != bound_phone_digest:
+                    raise PhoneVerificationChallengeError("challenge_phone_mismatch")
+                if now >= challenge.expires_at:
+                    if challenge.state not in {"consumed", "expired", "superseded"}:
+                        challenge.state = "expired"
+                        challenge.updated_at = now
+                    raise PhoneVerificationChallengeError("challenge_expired")
+
+                if challenge.state == "consumed":
+                    same_context = (
+                        challenge.completion_outcome == "new_account_created"
+                        and challenge.completion_sender_jkt_digest == sender_jkt_digest
+                        and challenge.completion_device_digest == device_digest
+                        and challenge.completion_origin == completion_origin
+                        and challenge.completed_session_sid is not None
+                        and challenge.completed_subject_id is not None
+                    )
+                    if not same_context:
+                        raise PhoneVerificationChallengeError("challenge_consumed")
+                    session_row = session.get(SessionRow, challenge.completed_session_sid)
+                    if (
+                        session_row is None
+                        or session_row.revoked_at is not None
+                        or now >= session_row.idle_expires_at
+                        or now >= session_row.absolute_expires_at
+                    ):
+                        raise PhoneVerificationChallengeError("challenge_consumed")
+                    return EnrollmentCompletionRecord(
+                        outcome="new_account_created",
+                        session=DurableSessionStore.snapshot_from_row(session_row),
+                        subject_id=challenge.completed_subject_id,
+                    )
+
+                if challenge.state != "verified" or challenge.verified_at is None:
+                    raise PhoneVerificationChallengeError("challenge_not_verified")
+
+                active_credential = session.scalar(
+                    select(CustomerPinCredentialRow)
+                    .where(
+                        CustomerPinCredentialRow.phone_lookup_digest == bound_phone_digest,
+                        CustomerPinCredentialRow.status == "active",
+                    )
+                    .with_for_update()
+                )
+                subject_row = session.scalar(
+                    select(CustomerSubjectRow)
+                    .where(
+                        CustomerSubjectRow.environment == environment,
+                        CustomerSubjectRow.relying_party == relying_party,
+                        CustomerSubjectRow.mapping_digest == mapping_digest,
+                    )
+                    .with_for_update()
+                )
+
+                challenge.state = "consumed"
+                challenge.consumed_at = now
+                challenge.updated_at = now
+                challenge.completion_sender_jkt_digest = sender_jkt_digest
+                challenge.completion_device_digest = device_digest
+                challenge.completion_origin = completion_origin
+
+                if active_credential is not None:
+                    challenge.completion_outcome = "account_already_exists"
+                    return EnrollmentCompletionRecord(outcome="account_already_exists")
+                if subject_row is not None:
+                    challenge.completion_outcome = "recovery_required"
+                    return EnrollmentCompletionRecord(outcome="recovery_required")
+
+                subject_id = str(uuid.uuid4())
+                subject_value = f"sub_{secrets.token_urlsafe(24)}"
+                subject = SubjectPolicy.create_server_issued_subject(
+                    value=subject_value,
+                    relying_party=relying_party,
+                    environment=environment,
+                )
+                session.add(
+                    CustomerSubjectRow(
+                        id=subject_id,
+                        subject_value=subject.value,
+                        environment=subject.environment,
+                        relying_party=subject.relying_party,
+                        mapping_digest=mapping_digest,
+                        created_at=now,
+                    )
+                )
+                session.add(
+                    CustomerPinCredentialRow(
+                        credential_id=str(uuid.uuid4()),
+                        customer_subject_id=subject_id,
+                        credential_type="XAFPAY_PIN",
+                        phone_lookup_digest=bound_phone_digest,
+                        credential_verifier=verifier,
+                        credential_version=1,
+                        status="active",
+                        created_at=now,
+                        updated_at=now,
+                        failed_attempt_count=0,
+                        locked_until=None,
+                        last_success_at=None,
+                    )
+                )
+                session.add(
+                    TrustedDeviceRow(
+                        id=str(uuid.uuid4()),
+                        customer_subject_id=subject_id,
+                        device_digest=device_digest,
+                        trusted_at=now,
+                        last_seen_at=now,
+                    )
+                )
+                session_row = SessionRow(
+                    sid=f"sid_{uuid.uuid4().hex}",
+                    subject_id=subject_id,
+                    subject_value=subject.value,
+                    sender_jkt=sender_jkt,
+                    created_at=now,
+                    auth_time=now,
+                    last_activity=now,
+                    idle_expires_at=now + timedelta(seconds=SESSION_IDLE_DEFAULT_SECONDS),
+                    absolute_expires_at=now + timedelta(seconds=SESSION_ABSOLUTE_DEFAULT_SECONDS),
+                    revoked_at=None,
+                    refresh_family_id=None,
+                    security_version=1,
+                )
+                session.add(session_row)
+                session.flush()
+
+                challenge.completion_outcome = "new_account_created"
+                challenge.completed_subject_id = subject_id
+                challenge.completed_session_sid = session_row.sid
+                return EnrollmentCompletionRecord(
+                    outcome="new_account_created",
+                    session=DurableSessionStore.snapshot_from_row(session_row),
+                    subject_id=subject_id,
+                )
+
+
 class DurablePinCredentialStore:
     def __init__(self, database: XciaDatabase) -> None:
         self._database = database
@@ -783,6 +1077,44 @@ class DurablePinCredentialStore:
                     CustomerPinCredentialRow.status == "active",
                 )
             )
+
+    def create_initial(
+        self,
+        *,
+        subject_id: str,
+        phone_lookup_digest: str,
+        verifier: str,
+        now: datetime,
+    ) -> CustomerPinCredentialRow:
+        with self._database.session() as session:
+            with session.begin():
+                active = session.scalar(
+                    select(CustomerPinCredentialRow)
+                    .where(
+                        CustomerPinCredentialRow.phone_lookup_digest == phone_lookup_digest,
+                        CustomerPinCredentialRow.status == "active",
+                    )
+                    .with_for_update()
+                )
+                if active is not None:
+                    raise ValueError("active credential already exists")
+                row = CustomerPinCredentialRow(
+                    credential_id=str(uuid.uuid4()),
+                    customer_subject_id=subject_id,
+                    credential_type="XAFPAY_PIN",
+                    phone_lookup_digest=phone_lookup_digest,
+                    credential_verifier=verifier,
+                    credential_version=1,
+                    status="active",
+                    created_at=now,
+                    updated_at=now,
+                    failed_attempt_count=0,
+                    locked_until=None,
+                    last_success_at=None,
+                )
+                session.add(row)
+                session.flush()
+                return row
 
     def replace(
         self,

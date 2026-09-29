@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -9,6 +10,10 @@ from xcia.adapters import (
     DurableSessionStore,
     DurableSubjectStore,
     SecurityEventStore,
+)
+from xcia.adapters.postgres import (
+    DurablePhoneVerificationChallengeStore,
+    PhoneVerificationChallengeError,
 )
 from xcia.config import Xcia3RuntimeSettings, XciaSettings
 from xcia.crypto import CredentialSecrets, create_verifier, normalize_phone, verify_pin
@@ -36,6 +41,12 @@ class AuthenticationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class EnrollmentResult:
+    outcome: str
+    authentication: AuthenticationResult | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CustomerPinAuthenticationService:
     settings: XciaSettings
     xcia3: Xcia3RuntimeSettings
@@ -44,15 +55,38 @@ class CustomerPinAuthenticationService:
     subjects: DurableSubjectStore
     sessions: DurableSessionStore
     credentials: DurablePinCredentialStore
+    challenges: DurablePhoneVerificationChallengeStore
     controls: DurableAuthenticationControlStore
     events: SecurityEventStore
 
     def start_phone_verification(self, phone: str, *, now: datetime) -> str:
         normalized_phone = normalize_phone(phone)
-        return self.phone_provider.begin(normalized_phone, now=now).challenge_id
+        challenge = self.phone_provider.begin(normalized_phone, now=now)
+        self.challenges.register(
+            challenge_id=challenge.challenge_id,
+            provider=self.phone_provider.__class__.__name__,
+            bound_phone_digest=self._phone_digest(normalized_phone),
+            created_at=now,
+            expires_at=challenge.expires_at,
+        )
+        return challenge.challenge_id
 
-    def verify_phone_proof(self, challenge_id: str, proof: str, *, now: datetime) -> None:
-        self._require_phone_proof(challenge_id, proof, now)
+    def verify_phone_proof(
+        self,
+        phone: str,
+        challenge_id: str,
+        proof: str,
+        *,
+        now: datetime,
+    ) -> None:
+        normalized_phone = normalize_phone(phone)
+        self.challenges.verify(
+            challenge_id=challenge_id,
+            bound_phone_digest=self._phone_digest(normalized_phone),
+            proof=proof,
+            now=now,
+            provider_verify=self.phone_provider.verify,
+        )
 
     def enroll(
         self,
@@ -63,40 +97,47 @@ class CustomerPinAuthenticationService:
         pin: str,
         sender_jkt: str,
         device_id: str,
+        completion_origin: str,
         now: datetime | None = None,
-    ) -> AuthenticationResult:
+    ) -> EnrollmentResult:
         moment = self._moment(now)
         normalized_phone = normalize_phone(phone)
-        self._require_phone_proof(challenge_id, proof, moment)
-        subject = self.subjects.create_or_lookup(
-            authentication_handle=self._authref(normalized_phone),
-            relying_party=self.settings.audience,
-            environment=self.settings.environment.value,
-            now=moment,
-        )
-        subject_id = self.subjects.subject_id(subject)
-        self.credentials.replace(
-            subject_id=subject_id,
-            phone_lookup_digest=self._phone_digest(normalized_phone),
-            verifier=create_verifier(pin, self.secrets),
-            now=moment,
-        )
-        self.controls.trust_device(subject_id, self._device_digest(device_id), now=moment)
-        result = self._establish_session(
-            subject,
-            subject_id,
-            sender_jkt,
-            moment,
-            "xcia3_pin_enrollment",
+        phone_digest = self._phone_digest(normalized_phone)
+        device_digest = self._device_digest(device_id)
+        try:
+            completion = self.challenges.complete_new_customer(
+                challenge_id=challenge_id,
+                bound_phone_digest=phone_digest,
+                mapping_digest=self._subject_mapping_digest(normalized_phone),
+                relying_party=self.settings.audience,
+                environment=self.settings.environment.value,
+                verifier=create_verifier(pin, self.secrets),
+                sender_jkt=sender_jkt,
+                sender_jkt_digest=self.secrets.opaque_digest(
+                    "xcia3/completion-sender-jkt", sender_jkt
+                ),
+                device_digest=device_digest,
+                completion_origin=completion_origin,
+                now=moment,
+            )
+        except PhoneVerificationChallengeError:
+            raise
+        if completion.outcome != "new_account_created":
+            return EnrollmentResult(outcome=completion.outcome)
+        if completion.session is None or completion.subject_id is None:
+            raise AuthenticationDenied("authentication_failed")
+        result = AuthenticationResult(
+            session=completion.session,
+            subject_id=completion.subject_id,
         )
         self.events.record(
             event_type="xcia3_pin_enrollment_succeeded",
-            detail="verifier-only credential enrolled after phone proof",
-            subject_value=subject.value,
+            detail="initial credential created after durable verified phone control",
+            subject_value=result.session.sub,
             sid=result.session.sid,
             occurred_at=moment,
         )
-        return result
+        return EnrollmentResult(outcome="new_account_created", authentication=result)
 
     def login(
         self,
@@ -266,6 +307,9 @@ class CustomerPinAuthenticationService:
 
     def _authref(self, phone: str) -> str:
         return f"authref_{self.secrets.opaque_digest('xcia3/phone-authref', phone)}"
+
+    def _subject_mapping_digest(self, phone: str) -> str:
+        return hashlib.sha256(self._authref(phone).encode("utf-8")).hexdigest()
 
     def _device_digest(self, device_id: str) -> str:
         if not device_id or len(device_id) > 512:

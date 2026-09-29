@@ -16,6 +16,7 @@ from xcia.adapters import (
     SecurityEventStore,
     compose_phone_verification_provider,
 )
+from xcia.adapters.postgres import DurablePhoneVerificationChallengeStore
 from xcia.app import create_app
 from xcia.config import RuntimeEnvironment, Xcia2RuntimeSettings, Xcia3RuntimeSettings, XciaSettings
 from xcia.crypto import CredentialSecrets, StagingEs256KeyProvider
@@ -30,7 +31,7 @@ from xcia.services import (
     WalletSessionHandoffService,
 )
 
-EXPECTED_REVISION = "fl1f_0001_wallet_session_handoff"
+EXPECTED_REVISION = "xcia_create_account_challenge_binding_0001"
 def _loaded_private_key(
     provider: StagingEs256KeyProvider,
     kid: str,
@@ -128,6 +129,7 @@ def create_staging_app() -> FastAPI:
     sessions = DurableSessionStore(database)
     subjects = DurableSubjectStore(database)
     credentials = DurablePinCredentialStore(database)
+    challenges = DurablePhoneVerificationChallengeStore(database)
     controls = DurableAuthenticationControlStore(database)
     events = SecurityEventStore(database)
     authentication = CustomerPinAuthenticationService(
@@ -138,6 +140,7 @@ def create_staging_app() -> FastAPI:
         subjects=subjects,
         sessions=sessions,
         credentials=credentials,
+        challenges=challenges,
         controls=controls,
         events=events,
     )
