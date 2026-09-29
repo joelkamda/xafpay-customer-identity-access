@@ -40,6 +40,30 @@ def test_bff_requires_exact_origin_and_csrf(database: XciaDatabase, settings: Xc
         ).status_code
         == 403
     )
+    assert (
+        client.post(
+            "/bff/auth/enrollment/start",
+            json=payload,
+            headers={"origin": "https://wallet.test"},
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/bff/auth/enrollment/start",
+            json=payload,
+            headers={"origin": "https://wallet.test", "x-xcia-csrf": "invalid"},
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/bff/auth/enrollment/start",
+            json=payload,
+            headers={"origin": "https://wallet.test", "x-xcia-csrf": "required"},
+        ).status_code
+        == 200
+    )
 
 
 def test_bff_sets_only_opaque_host_cookie(database: XciaDatabase, settings: XciaSettings) -> None:
@@ -58,12 +82,23 @@ def test_bff_sets_only_opaque_host_cookie(database: XciaDatabase, settings: Xcia
         headers=headers,
     )
     challenge = start.json()["challenge_id"]
+    proof = provider.expected_proof(challenge)
+    verify = client.post(
+        "/bff/auth/phone/verify",
+        json={
+            "phone": "+2348012345678",
+            "challenge_id": challenge,
+            "proof": proof,
+        },
+        headers=headers,
+    )
+    assert verify.status_code == 200
     complete = client.post(
         "/bff/auth/enrollment/complete",
         json={
             "phone": "+2348012345678",
             "challenge_id": challenge,
-            "proof": provider.expected_proof(challenge),
+            "proof": proof,
             "pin": "123456",
             "sender_jkt": "thumbprint_01JTESTKEY000000001",
             "device_id": "test-device-one",

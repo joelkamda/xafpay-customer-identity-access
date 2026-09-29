@@ -73,8 +73,8 @@ def test_x01_successful_login_issues_one_bound_handoff() -> None:
 
 
 def test_x02_successful_enrollment_issues_one_bound_handoff() -> None:
-    assert '@app.post("/bff/auth/enrollment/complete"' in APP
-    assert APP.count("return authentication_response(request, result.session)") >= 3
+    assert '"/bff/auth/enrollment/complete"' in APP
+    assert "return authentication_response(request, result.authentication.session)" in APP
 
 
 def test_x03_successful_recovery_issues_one_bound_handoff() -> None:

@@ -13,7 +13,7 @@ def test_database_schema_is_xcia_owned_only() -> None:
 
 
 def test_expected_migration_is_current(database: XciaDatabase) -> None:
-    assert database.schema_revision() == "xcia3_0001"
+    assert database.schema_revision() == "xcia_phone_challenge_bind_0001"
 
 
 def test_no_public_login_routes_are_implemented() -> None:

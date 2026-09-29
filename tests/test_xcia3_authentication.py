@@ -12,6 +12,7 @@ from xcia.adapters import (
     DurableSubjectStore,
     SecurityEventStore,
 )
+from xcia.adapters.postgres import DurablePhoneVerificationChallengeStore
 from xcia.config import RuntimeEnvironment, Xcia3RuntimeSettings, XciaSettings
 from xcia.crypto import CredentialSecrets
 from xcia.persistence import XciaDatabase
@@ -22,6 +23,8 @@ def make_service(
     database: XciaDatabase,
     settings: XciaSettings,
 ) -> tuple[CustomerPinAuthenticationService, DeterministicFakePhoneVerificationAdapter]:
+    with database.engine.begin() as connection:
+        connection.exec_driver_sql("DELETE FROM xcia_phone_verification_challenges")
     secret = b"xcia3 deterministic test credential root secret"
     provider = DeterministicFakePhoneVerificationAdapter(
         environment=RuntimeEnvironment.TEST,
@@ -36,6 +39,7 @@ def make_service(
             subjects=DurableSubjectStore(database),
             sessions=DurableSessionStore(database),
             credentials=DurablePinCredentialStore(database),
+            challenges=DurablePhoneVerificationChallengeStore(database),
             controls=DurableAuthenticationControlStore(database),
             events=SecurityEventStore(database),
         ),
@@ -49,14 +53,18 @@ def enroll(
     *,
     now: datetime,
 ) -> None:
-    challenge = service.start_phone_verification("+2348012345678", now=now)
+    phone = "+2348012345678"
+    challenge = service.start_phone_verification(phone, now=now)
+    proof = provider.expected_proof(challenge)
+    service.verify_phone_proof(phone, challenge, proof, now=now)
     service.enroll(
-        phone="+2348012345678",
+        phone=phone,
         challenge_id=challenge,
-        proof=provider.expected_proof(challenge),
+        proof=proof,
         pin="123456",
         sender_jkt="thumbprint_01JTESTKEY000000001",
         device_id="test-device-one",
+        completion_origin="https://wallet.test",
         now=now,
     )
 

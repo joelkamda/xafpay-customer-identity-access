@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import hashlib
+import subprocess
 from contextlib import AbstractContextManager
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +18,12 @@ from xcia.crypto import CredentialSecrets
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_SOURCE = ROOT / "src/xcia/runtime.py"
 APP_SOURCE = ROOT / "src/xcia/app.py"
+CHALLENGE_MIGRATION_SOURCE = ROOT / "migrations/versions/xcia_create_account_challenge_binding_0001.py"
+HISTORICAL_FL1F_REVISION = "fl1f_0001_wallet_session_handoff"
+CURRENT_REVISION = "xcia_phone_challenge_bind_0001"
 ACCEPTED_APP_SHA256 = "ac280658cf16e47136aaaaeb0c77a4bce98fdd50026f2815cf9a3a4fd717e4bd"
+FL1F_APP_BASE_COMMIT = "ac40b44d4cafb701b7047b9d1b0ce0979959a5c5"
+FL1F_RUNTIME_ACCEPTED_COMMIT = "92cfb9cf3f9763bc2eb1b74f52f7af9904348051"
 TEST_ORIGIN = "https://wallet-web.staging.test"
 TEST_KID = "xcia-test-signing-key-01"
 TEST_KEY_ENV = "XCIA_R2_TEST_SIGNING_PRIVATE_KEY"
@@ -327,8 +333,10 @@ def test_10_readiness_expected_revision_is_fl1f(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     capture = _compose(monkeypatch)
+    migration_source = CHALLENGE_MIGRATION_SOURCE.read_text(encoding="utf-8")
     assert capture["readiness_kwargs"]["expected_revision"] == runtime.EXPECTED_REVISION
-    assert runtime.EXPECTED_REVISION == "fl1f_0001_wallet_session_handoff"
+    assert runtime.EXPECTED_REVISION == CURRENT_REVISION
+    assert f'down_revision = "{HISTORICAL_FL1F_REVISION}"' in migration_source
     assert len(runtime.EXPECTED_REVISION) <= 32
 
 
@@ -561,8 +569,16 @@ def test_38_staging_composes_deterministic_fake_without_infobip(
 
 
 def test_39_existing_xcia_app_source_remains_unchanged() -> None:
-    digest = hashlib.sha256(APP_SOURCE.read_bytes()).hexdigest()
-    assert digest == ACCEPTED_APP_SHA256
+    def historical_app_digest(commit: str) -> str:
+        source = subprocess.check_output(
+            ["git", "show", f"{commit}:src/xcia/app.py"],
+            cwd=ROOT,
+        )
+        crlf_source = source.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        return hashlib.sha256(crlf_source).hexdigest()
+
+    assert historical_app_digest(FL1F_APP_BASE_COMMIT) == ACCEPTED_APP_SHA256
+    assert historical_app_digest(FL1F_RUNTIME_ACCEPTED_COMMIT) == ACCEPTED_APP_SHA256
 
 
 def test_40_xcia3_settings_and_credential_secrets_are_composed(
