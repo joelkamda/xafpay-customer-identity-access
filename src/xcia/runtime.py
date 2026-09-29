@@ -31,7 +31,7 @@ from xcia.services import (
     WalletSessionHandoffService,
 )
 
-EXPECTED_REVISION = "xcia_create_account_challenge_binding_0001"
+EXPECTED_REVISION = "xcia_phone_challenge_bind_0001"
 def _loaded_private_key(
     provider: StagingEs256KeyProvider,
     kid: str,

@@ -1,6 +1,6 @@
 """Bind phone-verification challenges to opaque phone identity.
 
-Revision ID: xcia_create_account_challenge_binding_0001
+Revision ID: xcia_phone_challenge_bind_0001
 Revises: fl1f_0001_wallet_session_handoff
 Create Date: 2026-09-29
 """
@@ -8,7 +8,7 @@ Create Date: 2026-09-29
 import sqlalchemy as sa
 from alembic import op
 
-revision = "xcia_create_account_challenge_binding_0001"
+revision = "xcia_phone_challenge_bind_0001"
 down_revision = "fl1f_0001_wallet_session_handoff"
 branch_labels = None
 depends_on = None
