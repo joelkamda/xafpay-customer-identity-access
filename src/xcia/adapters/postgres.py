@@ -1003,16 +1003,16 @@ class DurablePhoneVerificationChallengeStore:
                     relying_party=relying_party,
                     environment=environment,
                 )
-                session.add(
-                    CustomerSubjectRow(
-                        id=subject_id,
-                        subject_value=subject.value,
-                        environment=subject.environment,
-                        relying_party=subject.relying_party,
-                        mapping_digest=mapping_digest,
-                        created_at=now,
-                    )
+                subject_row = CustomerSubjectRow(
+                    id=subject_id,
+                    subject_value=subject.value,
+                    environment=subject.environment,
+                    relying_party=subject.relying_party,
+                    mapping_digest=mapping_digest,
+                    created_at=now,
                 )
+                session.add(subject_row)
+                session.flush([subject_row])
                 session.add(
                     CustomerPinCredentialRow(
                         credential_id=str(uuid.uuid4()),
